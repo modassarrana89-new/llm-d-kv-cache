@@ -245,40 +245,6 @@ From the repository root:
 make uds-tokenizer-service-test
 ```
 
-## Building Container Images
-
-The project provides two Dockerfiles for different deployment targets:
-
-### ODH (Open Data Hub) Build
-
-Uses standard Python base image and `pyproject.toml`:
-
-```bash
-podman build -f Dockerfile .
-```
-
-### RHDS Build
-
-Uses Red Hat UBI base image and `requirements.txt`:
-
-```bash
-podman build -f Dockerfile.konflux .
-```
-
-### Dependency Management
-
-- **pyproject.toml**: Defines direct dependencies for the project
-- **requirements.txt**: Generated from `uv.lock` for Konflux builds only
-
-To regenerate `requirements.txt` after updating dependencies:
-
-```bash
-# Update dependencies in pyproject.toml
-# Then regenerate the lock file and requirements.txt
-uv lock
-uv export --format requirements-txt --no-hashes --output-file requirements.txt
-```
-
 ## Kubernetes Deployment
 
 The service is designed to run in Kubernetes with:
@@ -306,25 +272,21 @@ See [tokenizers/README.md](tokenizers/README.md) for detailed information about 
 ```
 ├── run_grpc_server.py       # Main gRPC server entry point
 ├── tokenizer_grpc_service.py # gRPC service implementation
-├── Dockerfile               # Container build file (ODH)
-├── Dockerfile.konflux       # Container build file (RHDS/Konflux)
-├── pyproject.toml           # Direct dependencies (used by Dockerfile)
-├── requirements.txt         # Generated from uv.lock (used by Dockerfile.konflux)
+├── pyproject.toml           # Dependencies and package config
 ├── tokenizer_service/       # Core tokenizer service implementation
 │   ├── __init__.py
 │   ├── tokenizer.py         # Tokenizer service implementation
 │   └── exceptions.py        # Custom exceptions
-├── tokenizerpb/             # gRPC service definition
+├── tokenizerpb/              # gRPC service definition
 │   ├── tokenizer_pb2_grpc.py
 │   └── tokenizer_pb2.py
 ├── utils/                   # Utility functions
 │   ├── __init__.py
-│   ├── logger.py            # Logger functionality
-│   └── thread_pool_utils.py # Thread pool utilities
+│   └── logger.py            # Logger functionality
 ├── tests/                   # Test files
 │   ├── __init__.py
-│   ├── conftest.py          # Shared fixtures (in-process gRPC server)
-│   └── test_integration.py  # Integration tests (pytest)
+│   ├── conftest.py              # Shared fixtures (in-process gRPC server)
+│   ├── test_integration.py      # Integration tests (pytest)
 ├── tokenizers/              # Tokenizer files (downloaded automatically)
 └── README.md                # This file
 ```
