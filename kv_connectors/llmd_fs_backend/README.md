@@ -20,14 +20,14 @@ For simple setups, see the **Storage Cleanup** section.
 
 ## System Requirements
 
-- vLLM version 0.18.0. Previous versions are supported via their matching wheels in the [wheels](./wheels) folder or the corresponding llm-d-kv-cache release assets.
+- vLLM version 0.18.x. Previous versions are supported via their matching wheels in the [wheels](./wheels) folder or the corresponding llm-d-kv-cache release assets.
 
 ## Installation
 
 ### 1. Install from a pre-built wheel (Recommended)
 
 ```bash
-pip install https://raw.githubusercontent.com/llm-d/llm-d-kv-cache/main/kv_connectors/llmd_fs_backend/wheels/llmd_fs_connector-0.18.0-cp312-cp312-linux_x86_64.whl
+pip install https://raw.githubusercontent.com/llm-d/llm-d-kv-cache/main/kv_connectors/llmd_fs_backend/wheels/llmd_fs_connector-0.18-cp312-cp312-linux_x86_64.whl
 ```
 
 This installs:
@@ -66,6 +66,7 @@ pip install -e .
 - `block_size`: number of tokens stored per file (must be in granulaity of GPU block size).
 - `threads_per_gpu`: number of I/O threads per GPU
 - `max_staging_memory_gb`: total staging memory limit
+- `gds_mode`: GPUDirect Storage mode (default: `disabled`). See [GPUDirect Storage (GDS)](./docs/gds.md) for options, requirements, and verification.
 
 ### Environment variables
 - `STORAGE_LOG_LEVEL`: set the log level for both C++ and Python (`trace`, `debug`, `info`, `warn`, `error`). Default: `info`

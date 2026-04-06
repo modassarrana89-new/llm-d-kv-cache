@@ -210,6 +210,11 @@ unit-test-uds: check-go download-zmq ## Run unit tests without embedded tokenize
 	@printf "\033[33;1m==== Running unit tests (UDS-only, no embedded tokenizers) ====\033[0m\n"
 	@go test -v ./pkg/...
 
+.PHONY: unit-test-race
+unit-test-race: check-go download-zmq ## Run unit tests with Go race detector enabled
+	@printf "\033[33;1m==== Running unit tests with race detector ====\033[0m\n"
+	@go test -v -race ./pkg/...
+
 .PHONY: unit-test-embedded
 unit-test-embedded: check-go install-python-deps download-zmq ## Run unit tests with embedded tokenizers
 	@printf "\033[33;1m==== Running unit tests (with embedded tokenizers) ====\033[0m\n"
@@ -617,12 +622,15 @@ download-zmq: ## Install ZMQ dependencies based on OS/ARCH
 
 ##@ Examples
 
+UDS_TOKENIZER_GRPC_PORT ?= 50051
+UDS_TOKENIZER_HEALTH_PORT ?= 8082
+
 # Define a template for building examples
 define BUILD_EXAMPLE_TEMPLATE
-$(1): $$(SRC) | check-go install-python-deps download-zmq
+$(1): $$(SRC) | check-go
 	@echo "Building $$@..."
 	@mkdir -p $$(dir $$@)
-	@go build -tags $(EMBEDDED_TAGS) -o $$@ $(2)
+	@go build -o $$@ $(2)
 	@echo "✅ Built $$@"
 endef
 
@@ -654,8 +662,39 @@ EXAMPLE_SHORTS := offline online valkey kv_cache_index kv_cache_index_service
 .PHONY: $(EXAMPLE_SHORTS)
 $(EXAMPLE_SHORTS):
 
-.PHONY: run-example
-run-example: $(EXAMPLE) ## Run the example locally (e.g., make run-example offline)
+.PHONY: start-tokenizer
+start-tokenizer: check-container-tool ## Start the UDS tokenizer container; requires image-build-uds to have been run first
+	@printf "\033[33;1m==== Starting UDS tokenizer container ====\033[0m\n"
+	@$(CONTAINER_TOOL) run -d --rm --name uds-tokenizer-example --network host \
+		-e GRPC_PORT=$(UDS_TOKENIZER_GRPC_PORT) \
+		-e PROBE_PORT=$(UDS_TOKENIZER_HEALTH_PORT) \
+		$(UDS_TOKENIZER_IMAGE)
+	@printf "Waiting for tokenizer to be ready"
+	@for i in $$(seq 1 30); do \
+		if curl -sf http://localhost:$(UDS_TOKENIZER_HEALTH_PORT)/healthz > /dev/null 2>&1; then \
+			printf " ready!\n"; break; \
+		fi; \
+		if [ $$i -eq 30 ]; then \
+			printf " timeout!\n"; \
+			$(CONTAINER_TOOL) stop uds-tokenizer-example 2>/dev/null || true; \
+			exit 1; \
+		fi; \
+		printf "."; sleep 2; \
+	done
+
+.PHONY: stop-tokenizer
+stop-tokenizer: ## Stop and remove the UDS tokenizer container
+	@$(CONTAINER_TOOL) stop uds-tokenizer-example 2>/dev/null || true
+	@$(CONTAINER_TOOL) rm -f uds-tokenizer-example 2>/dev/null || true
+
+.PHONY: run-example-only
+run-example-only: $(EXAMPLE) ## Run the example binary only (tokenizer must already be running via start-tokenizer)
 	@printf "\033[33;1m==== Running example $(EXAMPLE) ====\033[0m\n"
-	@echo "Using PYTHONPATH=$(PYTHONPATH)"
-	@./$(EXAMPLE)
+	@TOKENIZER_ENDPOINT=localhost:$(UDS_TOKENIZER_GRPC_PORT) ./$(EXAMPLE)
+
+.PHONY: run-example
+run-example: ## Run the example with UDS tokenizer in Docker (e.g., make run-example offline); requires image-build-uds to have been run first
+	@$(MAKE) --no-print-directory start-tokenizer
+	@$(MAKE) --no-print-directory run-example-only; status=$$?; \
+		$(MAKE) --no-print-directory stop-tokenizer; \
+		exit $$status
