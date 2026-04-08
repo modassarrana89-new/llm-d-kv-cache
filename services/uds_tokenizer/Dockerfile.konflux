@@ -12,40 +12,374 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build stage
-FROM --platform=$TARGETPLATFORM registry.redhat.io/ubi10/python-312-minimal:10.1 as builder
 
-# Set build arguments
-ARG TARGETPLATFORM
+# -----------------------------------------------------------------------------
+# Global build ARGs 
+# -----------------------------------------------------------------------------
+ARG PYTHON_VERSION=3.12
+ARG BASE_UBI9_IMAGE_TAG=9.6
+ARG VLLM_VERSION=v0.18.0
+ARG TORCH_VERSION=2.10.0
+ARG TORCH_VISION_VERSION=v0.25.0
+ARG NUMACTL_VERSION=2.0.16
+ARG NUMBA_VERSION=0.61.2
+ARG LLVMLITE_VERSION=v0.44.0
+ARG LLVM_VERSION=llvmorg-15.0.7
+ARG OPENCV_VERSION=90
+ARG HEALTH_PORT=8082
 
-# Set working directory
+ARG TARGETARCH
+
+# -----------------------------------------------------------------------------
+# s390x | base: system build dependencies
+# -----------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${BASE_UBI9_IMAGE_TAG} AS s390x-base
+
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+WORKDIR /workspace
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN microdnf install -y \
+        which procps findutils tar vim git \
+        gcc-toolset-14 gcc-toolset-14-binutils gcc-toolset-14-libatomic-devel \
+        patch zlib-devel \
+        libjpeg-turbo-devel libtiff-devel libpng-devel \
+        libwebp-devel freetype-devel harfbuzz-devel \
+        openssl-devel \
+        openblas openblas-devel \
+        autoconf automake libtool cmake \
+        numpy libsndfile \
+        clang llvm-devel llvm-static clang-devel && \
+    microdnf clean all
+
+ENV GCC_TOOLSET_ROOT=/opt/rh/gcc-toolset-14/root \
+    PATH=/opt/rh/gcc-toolset-14/root/usr/bin:/usr/local/bin:/usr/bin:/bin \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/usr/local/lib:/usr/lib64 \
+    LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64 \
+    PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig
+
+# -----------------------------------------------------------------------------
+# s390x | python-install: create virtualenv at /opt/app-root 
+# -----------------------------------------------------------------------------
+FROM s390x-base AS s390x-python-install
+
+ARG PYTHON_VERSION
+ENV VIRTUAL_ENV=/opt/app-root
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+RUN microdnf install -y \
+        python${PYTHON_VERSION}-devel \
+        python${PYTHON_VERSION}-pip \
+        python${PYTHON_VERSION}-wheel && \
+    python${PYTHON_VERSION} -m venv $VIRTUAL_ENV && \
+    pip install --no-cache -U pip wheel uv && \
+    microdnf clean all
+
+# -----------------------------------------------------------------------------
+# s390x | numa-build: build numactl from source 
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-numa-build
+
+ARG NUMACTL_VERSION
+WORKDIR /tmp
+RUN curl -LO https://github.com/numactl/numactl/archive/refs/tags/v${NUMACTL_VERSION}.tar.gz && \
+    tar -xvzf v${NUMACTL_VERSION}.tar.gz && \
+    cd numactl-${NUMACTL_VERSION} && \
+    ./autogen.sh && \
+    ./configure && \
+    make
+
+ENV C_INCLUDE_PATH="/usr/local/include"
+
+# -----------------------------------------------------------------------------
+# s390x | numba-builder: build LLVM 15 → llvmlite → numba wheels
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-numba-builder
+
+ARG NUMBA_VERSION
+ARG LLVMLITE_VERSION
+ARG LLVM_VERSION
+WORKDIR /tmp
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    microdnf install -y ninja-build gcc gcc-c++ && \
+    git clone --recursive https://github.com/llvm/llvm-project.git \
+        -b ${LLVM_VERSION} && \
+    git clone --recursive https://github.com/numba/llvmlite.git \
+        -b ${LLVMLITE_VERSION} && \
+    git clone --recursive https://github.com/numba/numba.git \
+        -b ${NUMBA_VERSION} && \
+    # ---- Build LLVM ----
+    cd llvm-project && mkdir build && cd build && \
+    uv pip install 'cmake<4' 'setuptools<70' numpy && \
+    export PREFIX=/usr/local && \
+    cmake -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_LIBRARY_PATH="${PREFIX}" \
+          -DLLVM_ENABLE_PROJECTS="lld;libunwind;compiler-rt" \
+          -DLLVM_ENABLE_LIBEDIT=OFF \
+          -DLLVM_ENABLE_LIBXML2=OFF \
+          -DLLVM_ENABLE_RTTI=ON \
+          -DLLVM_ENABLE_TERMINFO=OFF \
+          -DLLVM_INCLUDE_BENCHMARKS=OFF \
+          -DLLVM_INCLUDE_DOCS=OFF \
+          -DLLVM_INCLUDE_EXAMPLES=OFF \
+          -DLLVM_INCLUDE_GO_TESTS=OFF \
+          -DLLVM_INCLUDE_TESTS=OFF \
+          -DLLVM_INCLUDE_UTILS=ON \
+          -DLLVM_INSTALL_UTILS=ON \
+          -DLLVM_UTILS_INSTALL_DIR=libexec/llvm \
+          -DLLVM_BUILD_LLVM_DYLIB=OFF \
+          -DLLVM_LINK_LLVM_DYLIB=OFF \
+          -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=WebAssembly \
+          -DLLVM_ENABLE_FFI=ON \
+          -DLLVM_ENABLE_Z3_SOLVER=OFF \
+          -DLLVM_OPTIMIZED_TABLEGEN=ON \
+          -DCMAKE_POLICY_DEFAULT_CMP0111=NEW \
+          -DCOMPILER_RT_BUILD_BUILTINS=ON \
+          -DCOMPILER_RT_BUILTINS_HIDE_SYMBOLS=OFF \
+          -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+          -DCOMPILER_RT_BUILD_CRT=OFF \
+          -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+          -DCOMPILER_RT_BUILD_PROFILE=OFF \
+          -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+          -DCOMPILER_RT_BUILD_XRAY=OFF \
+          -DCOMPILER_RT_BUILD_GWP_ASAN=OFF \
+          -DCOMPILER_RT_BUILD_ORC=OFF \
+          -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+          -GNinja ../llvm && \
+    ninja install && \
+    # ---- Build llvmlite ----
+    cd ../../llvmlite && python setup.py bdist_wheel && \
+    # ---- Build numba (patch dispatcher for Python 3.12) ----
+    cd ../numba && \
+    if ! grep -q '#include "dynamic_annotations.h"' numba/_dispatcher.cpp; then \
+        sed -i '/#include "internal\/pycore_atomic.h"/i\#include "dynamic_annotations.h"' \
+            numba/_dispatcher.cpp; \
+    fi && \
+    python setup.py bdist_wheel
+
+# -----------------------------------------------------------------------------
+# s390x | opencv-builder: build opencv-python-headless wheel from source.
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-opencv-builder
+
+WORKDIR /tmp
+ARG OPENCV_VERSION
+ARG ENABLE_HEADLESS=1
+ENV ENABLE_HEADLESS=${ENABLE_HEADLESS}
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install numpy setuptools wheel scikit_build build && \
+    git clone --recursive https://github.com/opencv/opencv-python.git \
+        -b ${OPENCV_VERSION} && \
+    cd opencv-python && \
+    python -m build --wheel --installer=uv --outdir /tmp/opencv-python/dist
+
+# -----------------------------------------------------------------------------
+# s390x | rust: install Rust toolchain (shared by hf-xet and outlines-core)
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-rust
+
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y && \
+    . "$CARGO_HOME/env" && \
+    rustup default stable && \
+    rustup show
+
+# -----------------------------------------------------------------------------
+# s390x | torch-vision: build torchvision wheel against CPU torch
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-torch-vision
+
+ARG TORCH_VERSION
+ARG TORCH_VISION_VERSION
+WORKDIR /tmp
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git clone https://github.com/pytorch/vision.git && \
+    cd vision && \
+    git checkout ${TORCH_VISION_VERSION} && \
+    uv pip install torch==${TORCH_VERSION} \
+        --index-url https://download.pytorch.org/whl/cpu && \
+    python setup.py bdist_wheel
+
+# -----------------------------------------------------------------------------
+# s390x | hf-xet-builder: build hf-xet wheel (Rust + maturin)
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-hf-xet-builder
+
+WORKDIR /tmp
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=s390x-rust,source=/root/.cargo,target=/root/.cargo,rw \
+    --mount=type=bind,from=s390x-rust,source=/root/.rustup,target=/root/.rustup,rw \
+    git clone https://github.com/huggingface/xet-core.git && \
+    cd xet-core/hf_xet/ && \
+    uv pip install maturin patchelf && \
+    python -m maturin build --release --out dist && \
+    mkdir -p /tmp/hf-xet/dist && \
+    cp dist/*.whl /tmp/hf-xet/dist/
+
+# -----------------------------------------------------------------------------
+# s390x | outlines-core-builder: build outlines-core wheel (Rust + maturin)
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-outlines-core-builder
+
+WORKDIR /tmp
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+ARG VLLM_VERSION
+ARG OUTLINES_CORE_VERSION
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=s390x-rust,source=/root/.cargo,target=/root/.cargo,rw \
+    --mount=type=bind,from=s390x-rust,source=/root/.rustup,target=/root/.rustup,rw \
+    # Clone vllm just to read requirements/common.txt for the version pin
+    git clone --depth=1 --branch releases/${VLLM_VERSION} \
+        https://github.com/vllm-project/vllm.git /tmp/vllm-src && \
+    OUTLINES_CORE_VERSION=${OUTLINES_CORE_VERSION:-$(grep -E '^outlines.core\s*==\s*[0-9.]+' \
+        /tmp/vllm-src/requirements/common.txt | grep -Eo '[0-9.]+')} && \
+    if [ -z "${OUTLINES_CORE_VERSION}" ]; then \
+        echo "ERROR: Could not determine outlines_core version from vllm requirements" >&2; \
+        exit 1; \
+    fi && \
+    git clone https://github.com/dottxt-ai/outlines-core.git && \
+    cd outlines-core && \
+    git checkout tags/${OUTLINES_CORE_VERSION} && \
+    sed -i "s/version = \"0.0.0\"/version = \"${OUTLINES_CORE_VERSION}\"/" Cargo.toml && \
+    uv pip install maturin && \
+    python -m maturin build --release --out dist
+
+# -----------------------------------------------------------------------------
+# s390x | vllm-cpu: assemble all wheels and build + install vLLM CPU wheel
+# -----------------------------------------------------------------------------
+FROM s390x-python-install AS s390x-vllm-cpu
+
+ARG PYTHON_VERSION
+ARG VLLM_VERSION
+ARG NUMACTL_VERSION
+ARG PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu"
+
+ENV UV_LINK_MODE=copy
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
+ENV PCP_DIR=/opt/rh/gcc-toolset-14/root
+ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+
+ENV PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+RUN git clone --depth=1 --branch releases/${VLLM_VERSION} \
+        https://github.com/vllm-project/vllm.git /workspace/vllm
+
+WORKDIR /workspace/vllm
+
+# Install numactl headers/libs
+RUN --mount=type=bind,from=s390x-numa-build,src=/tmp/numactl-${NUMACTL_VERSION},target=/numactl \
+    make -C /numactl install
+
+# Install all source-built dependency wheels + vLLM requirements.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=s390x-rust,source=/root/.cargo,target=/root/.cargo,rw \
+    --mount=type=bind,from=s390x-rust,source=/root/.rustup,target=/root/.rustup,rw \
+    --mount=type=bind,from=s390x-torch-vision,source=/tmp/vision/dist,target=/tmp/vision-wheels \
+    --mount=type=bind,from=s390x-hf-xet-builder,source=/tmp/hf-xet/dist,target=/tmp/hf-xet-wheels \
+    --mount=type=bind,from=s390x-numba-builder,source=/tmp/llvmlite/dist,target=/tmp/llvmlite-wheels \
+    --mount=type=bind,from=s390x-numba-builder,source=/tmp/numba/dist,target=/tmp/numba-wheels \
+    --mount=type=bind,from=s390x-opencv-builder,source=/tmp/opencv-python/dist,target=/tmp/opencv-wheels \
+    --mount=type=bind,from=s390x-outlines-core-builder,source=/tmp/outlines-core/dist,target=/tmp/outlines-core-wheels \
+    VISION_WHL=$(ls /tmp/vision-wheels/*.whl) && \
+    HF_XET_WHL=$(ls /tmp/hf-xet-wheels/*.whl) && \
+    LLVM_WHL=$(ls /tmp/llvmlite-wheels/*.whl) && \
+    NUMBA_WHL=$(ls /tmp/numba-wheels/*.whl) && \
+    OPENCV_WHL=$(ls /tmp/opencv-wheels/*.whl) && \
+    OUTLINES_WHL=$(ls /tmp/outlines-core-wheels/*.whl) && \
+    uv pip install -v \
+        "$VISION_WHL" \
+        "$HF_XET_WHL" \
+        "$LLVM_WHL" \
+        "$NUMBA_WHL" \
+        "$OPENCV_WHL" \
+        "$OUTLINES_WHL" \
+        --index-strategy unsafe-best-match \
+        -r requirements/cpu-build.txt \
+        -r requirements/cpu.txt
+
+# Build vLLM CPU wheel and install it
+RUN --mount=type=cache,target=/root/.cache/uv \
+    VLLM_TARGET_DEVICE=cpu VLLM_CPU_MOE_PREPACK=0 \
+        python setup.py bdist_wheel && \
+    uv pip install "$(echo dist/*.whl)[tensorizer]"
+
+
+# #############################################################################
+# ARCH-SPECIFIC BUILDER STAGES for uds-tokenizer
+# #############################################################################
+
+# -----------------------------------------------------------------------------
+# builder-s390x: add uds-tokenizer Python deps on top of vllm-cpu environment.
+# -----------------------------------------------------------------------------
+FROM s390x-vllm-cpu AS builder-s390x
+
 WORKDIR /app
-
-# Run as root for build stage
 USER root
 
-# use requirements.txt for konflux
+COPY requirements.txt /app/requirements.txt
+
+# Strip the vllm block and all --hash= lines from the pip-compile lockfile,
+# then install the remaining packages.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    sed '/^[[:space:]]*--hash=/d' /app/requirements.txt \
+        | sed 's/ \\$//' \
+        | sed '/^vllm==/d' \
+        > /tmp/reqs-no-vllm.txt && \
+    uv pip install --no-cache --index-strategy unsafe-best-match -r /tmp/reqs-no-vllm.txt
+
+# -----------------------------------------------------------------------------
+# builder-amd64 / builder-arm64: standard UBI10 pip install
+# -----------------------------------------------------------------------------
+FROM registry.redhat.io/ubi10/python-312-minimal:10.1 AS builder-standard
+
+WORKDIR /app
+USER root
+
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Runtime stage
-FROM --platform=$TARGETPLATFORM registry.redhat.io/ubi10/python-312-minimal:10.1 as runtime
 
-# Set build arguments
-ARG HEALTH_PORT=8082
+FROM builder-standard AS builder-amd64
+FROM builder-standard AS builder-arm64
 
-# Set working directory
+FROM builder-${TARGETARCH} AS builder
+
+
+# -----------------------------------------------------------------------------
+# runtime-base: common layer — app files, dirs, permissions, CMD.
+# -----------------------------------------------------------------------------
+FROM registry.redhat.io/ubi10/python-312-minimal:10.1 AS runtime-base
+
+ARG HEALTH_PORT
+
 WORKDIR /app
-
-# Copy installed dependencies from build stage (UBI uses /opt/app-root/)
-COPY --from=builder /opt/app-root/lib/python3.12/site-packages /opt/app-root/lib/python3.12/site-packages
-# Copy executables from build stage
-COPY --from=builder /opt/app-root/bin/ /opt/app-root/bin/
-
-# Need root for chown operations
 USER root
 
-# Copy project files into the image
+# Install numactl-libs on x86_64 and arm64 (s390x builds numactl from source)
+RUN if [ "$TARGETARCH" != "s390x" ]; then \
+        microdnf install -y numactl-libs && microdnf clean all; \
+    fi
+
 COPY run_grpc_server.py /app/
 COPY tokenizer_grpc_service.py /app/tokenizer_grpc_service.py
 COPY tokenizers/ /app/tokenizers/
@@ -53,42 +387,88 @@ COPY utils/ /app/utils/
 COPY tokenizer_service/ /app/tokenizer_service/
 COPY tokenizerpb/ /app/tokenizerpb/
 
-# Create directory for UDS socket
-RUN mkdir -p /tmp/tokenizer && chown 65532:65532 /tmp/tokenizer
-
-# Create tokenizer cache directories and set permissions
-ENV TOKENIZERS_DIR=/app/tokenizers
-RUN mkdir -p /app/tokenizers && chown -R 65532:65532 /app/tokenizers
-# Create and set permissions for ModelScope directory
-RUN mkdir -p /.modelscope && chown -R 65532:65532 /.modelscope
-# Create and set permissions for Hugging Face cache directory
-RUN mkdir -p /.cache && chown -R 65532:65532 /.cache
-# Add non-root user entry so getpwuid(65532) works (required by torch/getpass)
-RUN echo "nonroot:x:65532:65532:nonroot:/home/nonroot:/usr/sbin/nologin" >> /etc/passwd && \
+RUN mkdir -p /tmp/tokenizer && chown 65532:65532 /tmp/tokenizer && \
+    mkdir -p /app/tokenizers && chown -R 65532:65532 /app/tokenizers && \
+    mkdir -p /.modelscope && chown -R 65532:65532 /.modelscope && \
+    mkdir -p /.cache/vllm && chown -R 65532:65532 /.cache && \
+    echo "nonroot:x:65532:65532:nonroot:/home/nonroot:/usr/sbin/nologin" >> /etc/passwd && \
     mkdir -p /home/nonroot && chown 65532:65532 /home/nonroot
 
-# Set TMPDIR to the UDS socket directory, which is always mounted as a
-# writable emptyDir by KServe — even when readOnlyRootFilesystem is enforced
+ENV TOKENIZERS_DIR=/app/tokenizers
 ENV TMPDIR=/tmp/tokenizer
 
-# Switch to non-root user
-USER 65532:65532
-
-# Expose health check port (configurable via build arg)
 EXPOSE ${HEALTH_PORT}
-
-# Startup command: run direct gRPC server
+USER 65532:65532
 CMD ["python", "/app/run_grpc_server.py"]
 
-# Test stage - validates critical imports without affecting final image size
-FROM runtime as test
+# -----------------------------------------------------------------------------
+# runtime-amd64 / runtime-arm64 
+# -----------------------------------------------------------------------------
+FROM runtime-base AS runtime-amd64
+COPY --from=builder-standard /opt/app-root/lib/python3.12/site-packages \
+                              /opt/app-root/lib/python3.12/site-packages
+COPY --from=builder-standard /opt/app-root/bin/ /opt/app-root/bin/
+
+ENV VLLM_CACHE_ROOT=/.cache/vllm
+ENV HF_HOME=/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/.cache/huggingface
+
+FROM runtime-base AS runtime-arm64
+COPY --from=builder-standard /opt/app-root/lib/python3.12/site-packages \
+                              /opt/app-root/lib/python3.12/site-packages
+COPY --from=builder-standard /opt/app-root/bin/ /opt/app-root/bin/
+
+ENV VLLM_CACHE_ROOT=/.cache/vllm
+ENV HF_HOME=/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/.cache/huggingface
+
+# -----------------------------------------------------------------------------
+# runtime-s390x : copy the source-built venv + native libs.
+# -----------------------------------------------------------------------------
+FROM runtime-base AS runtime-s390x
+
+ARG PYTHON_VERSION
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+ENV LD_LIBRARY_PATH="/opt/app-root/lib64/python${PYTHON_VERSION}/site-packages/torch/lib:/usr/local/lib:/usr/lib64"
+
+COPY --from=builder-s390x /opt/app-root/lib/python3.12/site-packages \
+                           /opt/app-root/lib/python3.12/site-packages
+COPY --from=builder-s390x /opt/app-root/bin/ /opt/app-root/bin/
+COPY --from=builder-s390x /usr/local/lib /usr/local/lib
+
+
+USER root
+RUN microdnf install -y libgfortran libgomp openssl-libs && microdnf clean all
+COPY --from=builder-s390x /usr/lib64/libopenblas*.so*  /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libtiff.so*       /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libjbig.so*       /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libjbig85.so*     /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libLerc.so*       /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libzstd.so*       /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/liblzma.so*       /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libdeflate.so*    /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libjpeg.so*       /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libpng16.so*      /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libwebp.so*       /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libfreetype.so*   /usr/lib64/
+COPY --from=builder-s390x /usr/lib64/libharfbuzz.so*   /usr/lib64/
+USER 65532:65532
+
+
+FROM runtime-${TARGETARCH} AS runtime
+
+FROM runtime AS test
+
+USER root
 RUN python -c "\
 from tokenizer_service.renderer import RendererService; \
 from tokenizer_service.tokenizer import TokenizerService; \
 from tokenizer_grpc_service import create_grpc_server; \
 print('smoke test passed')"
+USER 65532:65532
 
-# Final stage
+
 FROM runtime
 
 LABEL com.redhat.component="odh-llm-d-kv-cache-rhel9" \
@@ -99,3 +479,6 @@ LABEL com.redhat.component="odh-llm-d-kv-cache-rhel9" \
       io.k8s.display-name="odh-llm-d-kv-cache" \
       io.k8s.description="odh-llm-d-kv-cache" \
       com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+
+
